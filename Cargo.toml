@@ -1,0 +1,7 @@
+[package]
+name = "oxide-barrier"
+version = "0.1.0"
+edition = "2021"
+description = "Synchronization barriers for GPU kernel phases with ternary arrival states. {+1=all_arrived, 0=some_waiting, -1=timeout}. Counting, cyclic, and phase barriers."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/oxide-barrier"

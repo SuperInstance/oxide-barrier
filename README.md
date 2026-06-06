@@ -1,86 +1,71 @@
 # oxide-barrier
 
-Synchronization barriers for GPU kernel phases with ternary arrival states. {+1=all_arrived, 0=some_waiting, -1=timeout}. Counting, cyclic, and phase barriers.
+*Synchronization barriers for GPU kernel phases. Ternary arrival states: which threads have arrived (+1), which are in transit (0), and which haven't started (-1).*
 
-## Overview
+## Why This Exists
 
-# oxide-barrier
+GPU barriers are expensive. Every thread in a block must reach the barrier before any can proceed. On NVIDIA hardware, `__syncthreads()` is a hardware instruction — fast but inflexible. For multi-kernel coordination (where different kernels run in sequence and need to synchronize), you need software barriers.
 
-Synchronization barriers for GPU kernel phases with ternary arrival states.
+The ternary arrival state tells you *why* a barrier hasn't been satisfied:
+- **+1 (Arrived):** Thread reached the barrier. Ready to proceed.
+- **0 (InTransit):** Thread is running but hasn't reached the barrier yet.
+- **-1 (NotStarted/Errored):** Thread hasn't begun, or it failed.
+
+This information enables smart waiting: spin if most threads are in transit, block if many haven't started, abort if there are errors.
 
 ## Architecture
 
-This crate sits within the **five-layer Oxide Stack**:
-
-| Layer | Crate | Role |
-|-------|-------|------|
-| 1 | open-parallel | Async runtime (tokio fork) |
-| 2 | pincher | "Vector DB as runtime, LLM as compiler" |
-| 3 | flux-core | Bytecode VM + A2A agent protocol |
-| 4 | cuda-oxide | Flux→MIR→Pliron→NVVM→PTX compiler |
-| 5 | cudaclaw | Persistent GPU kernels, warp consensus, SmartCRDT |
-
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
-
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 8 |
-| Lines of Code | 171 |
-| Public API Surface | 20 items |
-| License | Apache-2.0 |
-
-## Installation
-
-```toml
-[dependencies]
-oxide-barrier = "0.1.0"
 ```
+Phase 1 Kernel ──→ Barrier ──→ Phase 2 Kernel ──→ Barrier ──→ Phase 3
+                    ↑                              ↑
+              Check arrival states           Check arrival states
+              +1: 192/256 threads arrived
+               0:  48/256 in transit
+              -1:  16/256 not started
+```
+
+### Key Types
+
+- **`Barrier`** — N-thread synchronization point with ternary arrival tracking.
+- **`ArrivalState`** — Arrived / InTransit / NotStarted / Errored per thread.
+- **`PhaseTracker`** — Coordinate multiple barriers in sequence (phase 1 → 2 → 3 → ...).
+- **`BarrierStats`** — Arrival counts by state, estimated wait time, timeout detection.
 
 ## Usage
 
 ```rust
 use oxide_barrier::*;
-// See src/lib.rs tests for complete working examples
+
+// 256 threads, 3 phases
+let mut tracker = PhaseTracker::new(256, 3);
+
+// Simulate thread arrivals
+tracker.arrive(0, ThreadId(42));  // Thread 42 arrives at phase 0
+tracker.in_transit(0, ThreadId(100)); // Thread 100 still running
+
+// Check barrier state
+let stats = tracker.barrier_stats(0);
+println!("Arrived: {}/{}", stats.arrived, stats.total);
+
+// Wait for barrier satisfaction
+if tracker.wait(0, timeout_ms) {
+    // All arrived — proceed to next phase
+    tracker.advance();
+} else {
+    // Timeout — check which threads are stuck
+    let stuck = tracker.not_arrived(0);
+}
 ```
 
-### Key Types
+## The Deeper Idea
 
-```
-- pub enum ArrivalState { AllArrived = 1, SomeWaiting = 0, Timeout = -1 }
-- pub struct CountingBarrier {
-    pub fn new(parties: usize) -> Self {
-    pub fn arrive(&mut self) -> ArrivalState {
-    pub fn timeout(&mut self) -> ArrivalState {
-    pub fn state(&self) -> ArrivalState {
-    pub fn generation(&self) -> u64 { self.generation }
-    pub fn total_waits(&self) -> u64 { self.total_waits }
-    pub fn waiting(&self) -> usize { self.arrived }
-- pub struct CyclicBarrier {
-```
+Barrier arrival states map directly to `agent-sync`'s timing model. An agent that arrives early, on-time, or late has the same dynamics as a GPU thread reaching a barrier. The agent-sync experiment proved that timing beats quality (2.46× advantage) — the same principle applies to barrier design. A barrier that knows arrival states can make smarter decisions about waiting.
 
-## Design Philosophy
+The connection to `ternary-fence` is structural: fences are memory-level barriers (ensure writes are visible), while this crate provides execution-level barriers (ensure threads have reached a point). Together they form the complete synchronization story.
 
-This crate uses **ternary algebra** (Z₃) where every value is {-1, 0, +1}:
+## Related Crates
 
-- **+1** → positive signal (healthy, allocated, converged, ready)
-- **0** → neutral (pending, balanced, monitoring, degraded)
-- **-1** → negative signal (failed, free, diverged, overloaded)
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary neural networks at 60% less power
-2. **GPU warp voting** — hardware ballot instructions return ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity (what goes in must come out)
-
-## Testing
-
-```bash
-git clone https://github.com/SuperInstance/oxide-barrier.git
-cd oxide-barrier
-cargo test
-```
-
-## License
-
-Apache-2.0
+- `oxide-epoch` — Epoch management that coordinates with barrier phases
+- `oxide-workflow` — DAG execution that uses barriers between kernel steps
+- `ternary-fence` — Memory fences (the hardware-level counterpart)
+- `agent-sync` — Agent timing coordination (the same pattern at fleet scale)

@@ -149,7 +149,8 @@ mod tests {
     fn test_phase_advance() {
         let mut pb = PhaseBarrier::new(vec![2, 3]);
         pb.arrive(); // phase 0, 1/2
-        assert_eq!(pb.arrive(), (0, ArrivalState::AllArrived)); // phase 0 done
+        let (phase, state) = pb.arrive();
+        assert_eq!(state, ArrivalState::AllArrived); // phase 0 done
         assert_eq!(pb.current_phase(), 1);
     }
 

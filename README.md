@@ -1,107 +1,135 @@
 # Oxide Barrier
 
-**Oxide Barrier** provides GPU synchronization barriers with ternary arrival states — `+1` (all arrived), `0` (some waiting), `-1` (timeout) — enabling coordinated multi-kernel execution phases on GPU hardware.
+**Oxide Barrier** provides synchronization barriers for GPU kernel phases with ternary arrival states — `+1 (AllArrived)`, `0 (SomeWaiting)`, `-1 (Timeout)` — featuring counting barriers, cyclic barriers with maximum generations, and multi-phase barriers with per-phase party counts.
 
 ## Why It Matters
 
-GPU compute pipelines require explicit synchronization between kernel phases. Without barriers, a downstream kernel may read uninitialized memory from an upstream kernel that hasn't finished writing. CPU-side `cudaDeviceSynchronize()` is too coarse — it stalls the entire device. Oxide Barrier provides fine-grained, phase-level barriers with timeout detection, enabling robust error recovery in production GPU workloads. The ternary arrival state maps directly to the SuperInstance conservation framework.
+GPU computation involves thousands of threads that must synchronize at defined points: all threads must finish phase A before any thread starts phase B. Standard barriers (C++ `std::barrier`, Java `CyclicBarrier`) are binary — either waiting or released. Oxide Barrier adds a third state: Timeout, indicating that not all threads arrived within the deadline and the barrier was force-released. This ternary state enables more nuanced synchronization: kernel code can branch on timeout (skip computation, use fallback, or abort) rather than deadlock indefinitely.
 
 ## How It Works
 
 ### Counting Barrier
 
-A `CountingBarrier` blocks until N parties have arrived:
-
 ```
-arrive():
-  arrived += 1
-  if arrived >= parties:
+CountingBarrier { parties: N, arrived: 0, generation: 0 }
+
+arrive() → ArrivalState:
+    arrived += 1
+    if arrived >= parties:
+        arrived = 0
+        generation += 1
+        return AllArrived (+1)
+    else:
+        return SomeWaiting (0)
+
+timeout() → ArrivalState:
     arrived = 0
     generation += 1
-    return AllArrived (+1)
-  else:
-    return SomeWaiting (0)
-
-timeout():
-  arrived = 0
-  generation += 1
-  return Timeout (-1)
+    return Timeout (-1)
 ```
 
-Operations: **O(1)**. The `generation` counter enables detection of stale waits — if a thread's expected generation differs from the current generation, another phase has already completed.
+`arrive()`: **O(1)** (increment + compare). `timeout()`: **O(1)** (reset + increment).
 
 ### Cyclic Barrier
 
-A `CyclicBarrier` resets after all parties arrive, enabling repeated use across multiple kernel phases:
+Wraps `CountingBarrier` with a maximum cycle count:
 
 ```
-Phase 1: arrive() × N → AllArrived → reset
-Phase 2: arrive() × N → AllArrived → reset
-...
+CyclicBarrier { inner: CountingBarrier, max_cycles: N }
+
+arrive() → ArrivalState:
+    state = inner.arrive()
+    if inner.generation() > max_cycles:
+        return Timeout (-1)   // exhausted
+    return state
+
+is_complete() → inner.generation() >= max_cycles
 ```
 
-The barrier can be reused indefinitely without reallocation.
+Use case: limit GPU kernel iterations. After N barrier cycles, force termination to prevent infinite loops. Cost: **O(1)** per arrive.
 
 ### Phase Barrier
 
-A `PhaseBarrier` tracks a monotonically increasing phase counter:
+Multiple barriers sequenced as phases:
 
 ```
-phase_0 → phase_1 → phase_2 → ...
+PhaseBarrier { phases: [CountingBarrier; P], current_phase: 0 }
+
+arrive() → (phase_index, ArrivalState):
+    state = phases[current_phase].arrive()
+    if state == AllArrived && current_phase < P-1:
+        current_phase += 1     // advance to next phase
+    return (current_phase, state)
+
+is_complete() → last_phase released
 ```
 
-Each phase has its own arrival state. This enables pipelined execution: while phase N's barrier waits, phase N-1's data can be consumed.
+Example: Phase 0 (4 threads compute), Phase 1 (2 threads reduce), Phase 2 (1 thread writeback). Per-phase party count varies. Cost: **O(1)** per arrive.
 
-### Ternary State Mapping
+### Generation Tracking
+
+Each barrier release increments `generation`:
+- Enables detection of stale threads (thread arrives at generation 3 but barrier is at generation 5)
+- `total_waits()` counts successful barrier releases (not individual arrivals)
+- Useful for debugging: if `total_waits × parties ≠ total_arrivals`, some threads skipped barriers
+
+### Ternary State Diagram
 
 ```
-+1 (AllArrived) → phase complete, safe to proceed
- 0 (SomeWaiting) → in progress, continue waiting
--1 (Timeout)     → failure, trigger recovery
+    arrive()           arrive()           arrive()
+     (1/N)              (2/N)              (N/N)
+SomeWaiting ──→ SomeWaiting ──→ ... ──→ AllArrived
+  (0)             (0)                    (+1)
+                                           │
+                                       timeout()
+                                           ↓
+                                      Timeout (-1)
 ```
-
-This maps to the γ + η = C framework: γ = proceed (+1), neutral = wait (0), η = abort (-1).
 
 ## Quick Start
 
 ```rust
-use oxide_barrier::{CountingBarrier, ArrivalState};
+use oxide_barrier::{CountingBarrier, CyclicBarrier, PhaseBarrier, ArrivalState};
 
-let mut barrier = CountingBarrier::new(4); // 4 parties
-for _ in 0..3 {
-    assert_eq!(barrier.arrive(), ArrivalState::SomeWaiting);
-}
+// Counting barrier: 3 threads
+let mut barrier = CountingBarrier::new(3);
+assert_eq!(barrier.arrive(), ArrivalState::SomeWaiting);
+assert_eq!(barrier.arrive(), ArrivalState::SomeWaiting);
 assert_eq!(barrier.arrive(), ArrivalState::AllArrived);
+assert_eq!(barrier.generation(), 1);
 
-// Timeout scenario
-let mut b2 = CountingBarrier::new(4);
-b2.arrive();
-assert_eq!(b2.timeout(), ArrivalState::Timeout);
+// Cyclic barrier: 2 threads, max 3 cycles
+let mut cyclic = CyclicBarrier::new(2, 3);
+for _ in 0..3 { cyclic.arrive(); cyclic.arrive(); }
+assert!(cyclic.is_complete());
+
+// Phase barrier: phase 0 (2 parties), phase 1 (3 parties)
+let mut phased = PhaseBarrier::new(vec![2, 3]);
+phased.arrive(); phased.arrive(); // phase 0 complete
+assert_eq!(phased.current_phase(), 1);
 ```
 
 ## API
 
-| Type | Description |
-|------|-------------|
-| `ArrivalState` | `AllArrived (+1)`, `SomeWaiting (0)`, `Timeout (-1)` |
-| `CountingBarrier` | One-shot barrier for N parties |
-| `CyclicBarrier` | Resettable barrier for repeated phases |
-| `PhaseBarrier` | Monotonic phase tracking with per-phase state |
-
-Key methods: `arrive()`, `timeout()`, `state()`, `generation()`, `total_waits()`.
+| Type | Methods | Description |
+|------|---------|-------------|
+| `CountingBarrier` | `new(parties)`, `arrive() → ArrivalState`, `timeout()`, `state()`, `generation()`, `waiting()`, `total_waits()` | Basic N-party barrier |
+| `CyclicBarrier` | `new(parties, max_cycles)`, `arrive()`, `is_complete()`, `cycle()` | Bounded-lifetime barrier |
+| `PhaseBarrier` | `new(phase_parties: Vec<usize>)`, `arrive() → (usize, ArrivalState)`, `current_phase()`, `total_phases()`, `is_complete()` | Multi-phase sequenced barriers |
+| `ArrivalState` | `AllArrived (+1)`, `SomeWaiting (0)`, `Timeout (-1)` | Ternary result enum |
 
 ## Architecture Notes
 
-Oxide Barrier is part of the oxide-* GPU infrastructure stack in SuperInstance. In γ + η = C, barriers control γ (growth — synchronizing computation phases) and η (avoidance — timeouts that prevent deadlocks from blocking the entire system). The `oxide-ring` crate uses these barriers for event buffer synchronization, and `oxide-epoch` uses them for memory reclamation phase coordination.
+Oxide Barrier provides GPU kernel synchronization primitives for SuperInstance. In γ + η = C, AllArrived (+1) represents γ (growth — all threads completed their computation, enabling progress), Timeout (-1) represents η (avoidance — deadlock prevention by force-releasing stuck threads), and SomeWaiting (0) is the neutral state where the outcome is undecided. The generation counter enforces C: each generation is one complete cycle, and stale threads are detected by generation mismatch. Integrates with `oxide-ring` for event logging during synchronization and `oxide-epoch` for epoch-based memory management.
 
-See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for the GPU stack architecture.
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU synchronization architecture.
 
 ## References
 
-1. NVIDIA (2024). *CUDA C++ Programming Guide*. Chapter 7: "Memory Synchronization."
-2. Herlihy, M. & Shavit, N. (2012). *The Art of Multiprocessor Programming*, 2nd ed. MIT Press. Chapter 17: Barriers.
-3. Hoefler, T. et al. (2014). "Energy-efficient credit-based cooperative barrier." *IEEE Parallel and Distributed Processing Symposium*.
+1. NVIDIA Corporation (2024). *CUDA C++ Programming Guide: Cooperative Groups*. Section 7.
+2. Herlihy, M. & Shavit, N. (2012). *The Art of Multiprocessor Programming*, revised. Morgan Kaufmann. Chapter 3: Synchronization.
+3. Mellor-Crummey, J. M. & Scott, M. L. (1991). "Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors." *ACM TOCS*, 9(1), 21–65.
 
 ## License
 
-MIT
+Apache-2.0

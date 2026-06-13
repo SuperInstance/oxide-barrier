@@ -1,71 +1,107 @@
-# oxide-barrier
+# Oxide Barrier
 
-*Synchronization barriers for GPU kernel phases. Ternary arrival states: which threads have arrived (+1), which are in transit (0), and which haven't started (-1).*
+**Oxide Barrier** provides GPU synchronization barriers with ternary arrival states — `+1` (all arrived), `0` (some waiting), `-1` (timeout) — enabling coordinated multi-kernel execution phases on GPU hardware.
 
-## Why This Exists
+## Why It Matters
 
-GPU barriers are expensive. Every thread in a block must reach the barrier before any can proceed. On NVIDIA hardware, `__syncthreads()` is a hardware instruction — fast but inflexible. For multi-kernel coordination (where different kernels run in sequence and need to synchronize), you need software barriers.
+GPU compute pipelines require explicit synchronization between kernel phases. Without barriers, a downstream kernel may read uninitialized memory from an upstream kernel that hasn't finished writing. CPU-side `cudaDeviceSynchronize()` is too coarse — it stalls the entire device. Oxide Barrier provides fine-grained, phase-level barriers with timeout detection, enabling robust error recovery in production GPU workloads. The ternary arrival state maps directly to the SuperInstance conservation framework.
 
-The ternary arrival state tells you *why* a barrier hasn't been satisfied:
-- **+1 (Arrived):** Thread reached the barrier. Ready to proceed.
-- **0 (InTransit):** Thread is running but hasn't reached the barrier yet.
-- **-1 (NotStarted/Errored):** Thread hasn't begun, or it failed.
+## How It Works
 
-This information enables smart waiting: spin if most threads are in transit, block if many haven't started, abort if there are errors.
+### Counting Barrier
 
-## Architecture
+A `CountingBarrier` blocks until N parties have arrived:
 
 ```
-Phase 1 Kernel ──→ Barrier ──→ Phase 2 Kernel ──→ Barrier ──→ Phase 3
-                    ↑                              ↑
-              Check arrival states           Check arrival states
-              +1: 192/256 threads arrived
-               0:  48/256 in transit
-              -1:  16/256 not started
+arrive():
+  arrived += 1
+  if arrived >= parties:
+    arrived = 0
+    generation += 1
+    return AllArrived (+1)
+  else:
+    return SomeWaiting (0)
+
+timeout():
+  arrived = 0
+  generation += 1
+  return Timeout (-1)
 ```
 
-### Key Types
+Operations: **O(1)**. The `generation` counter enables detection of stale waits — if a thread's expected generation differs from the current generation, another phase has already completed.
 
-- **`Barrier`** — N-thread synchronization point with ternary arrival tracking.
-- **`ArrivalState`** — Arrived / InTransit / NotStarted / Errored per thread.
-- **`PhaseTracker`** — Coordinate multiple barriers in sequence (phase 1 → 2 → 3 → ...).
-- **`BarrierStats`** — Arrival counts by state, estimated wait time, timeout detection.
+### Cyclic Barrier
 
-## Usage
+A `CyclicBarrier` resets after all parties arrive, enabling repeated use across multiple kernel phases:
+
+```
+Phase 1: arrive() × N → AllArrived → reset
+Phase 2: arrive() × N → AllArrived → reset
+...
+```
+
+The barrier can be reused indefinitely without reallocation.
+
+### Phase Barrier
+
+A `PhaseBarrier` tracks a monotonically increasing phase counter:
+
+```
+phase_0 → phase_1 → phase_2 → ...
+```
+
+Each phase has its own arrival state. This enables pipelined execution: while phase N's barrier waits, phase N-1's data can be consumed.
+
+### Ternary State Mapping
+
+```
++1 (AllArrived) → phase complete, safe to proceed
+ 0 (SomeWaiting) → in progress, continue waiting
+-1 (Timeout)     → failure, trigger recovery
+```
+
+This maps to the γ + η = C framework: γ = proceed (+1), neutral = wait (0), η = abort (-1).
+
+## Quick Start
 
 ```rust
-use oxide_barrier::*;
+use oxide_barrier::{CountingBarrier, ArrivalState};
 
-// 256 threads, 3 phases
-let mut tracker = PhaseTracker::new(256, 3);
-
-// Simulate thread arrivals
-tracker.arrive(0, ThreadId(42));  // Thread 42 arrives at phase 0
-tracker.in_transit(0, ThreadId(100)); // Thread 100 still running
-
-// Check barrier state
-let stats = tracker.barrier_stats(0);
-println!("Arrived: {}/{}", stats.arrived, stats.total);
-
-// Wait for barrier satisfaction
-if tracker.wait(0, timeout_ms) {
-    // All arrived — proceed to next phase
-    tracker.advance();
-} else {
-    // Timeout — check which threads are stuck
-    let stuck = tracker.not_arrived(0);
+let mut barrier = CountingBarrier::new(4); // 4 parties
+for _ in 0..3 {
+    assert_eq!(barrier.arrive(), ArrivalState::SomeWaiting);
 }
+assert_eq!(barrier.arrive(), ArrivalState::AllArrived);
+
+// Timeout scenario
+let mut b2 = CountingBarrier::new(4);
+b2.arrive();
+assert_eq!(b2.timeout(), ArrivalState::Timeout);
 ```
 
-## The Deeper Idea
+## API
 
-Barrier arrival states map directly to `agent-sync`'s timing model. An agent that arrives early, on-time, or late has the same dynamics as a GPU thread reaching a barrier. The agent-sync experiment proved that timing beats quality (2.46× advantage) — the same principle applies to barrier design. A barrier that knows arrival states can make smarter decisions about waiting.
+| Type | Description |
+|------|-------------|
+| `ArrivalState` | `AllArrived (+1)`, `SomeWaiting (0)`, `Timeout (-1)` |
+| `CountingBarrier` | One-shot barrier for N parties |
+| `CyclicBarrier` | Resettable barrier for repeated phases |
+| `PhaseBarrier` | Monotonic phase tracking with per-phase state |
 
-The connection to `ternary-fence` is structural: fences are memory-level barriers (ensure writes are visible), while this crate provides execution-level barriers (ensure threads have reached a point). Together they form the complete synchronization story.
+Key methods: `arrive()`, `timeout()`, `state()`, `generation()`, `total_waits()`.
 
-## Related Crates
+## Architecture Notes
 
-- `oxide-epoch` — Epoch management that coordinates with barrier phases
-- `oxide-workflow` — DAG execution that uses barriers between kernel steps
-- `ternary-fence` — Memory fences (the hardware-level counterpart)
-- `agent-sync` — Agent timing coordination (the same pattern at fleet scale)
+Oxide Barrier is part of the oxide-* GPU infrastructure stack in SuperInstance. In γ + η = C, barriers control γ (growth — synchronizing computation phases) and η (avoidance — timeouts that prevent deadlocks from blocking the entire system). The `oxide-ring` crate uses these barriers for event buffer synchronization, and `oxide-epoch` uses them for memory reclamation phase coordination.
+
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for the GPU stack architecture.
+
+## References
+
+1. NVIDIA (2024). *CUDA C++ Programming Guide*. Chapter 7: "Memory Synchronization."
+2. Herlihy, M. & Shavit, N. (2012). *The Art of Multiprocessor Programming*, 2nd ed. MIT Press. Chapter 17: Barriers.
+3. Hoefler, T. et al. (2014). "Energy-efficient credit-based cooperative barrier." *IEEE Parallel and Distributed Processing Symposium*.
+
+## License
+
+MIT
